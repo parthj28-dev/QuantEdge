@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantedge"
+version = "0.1.0"
+description = "QuantEdge — Portfolio Risk & Optimization Lab (research / educational tool)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+# Exact pins: these are the versions the test suite was run against.
+# Loosen deliberately (and re-run tests) rather than accidentally.
+dependencies = [
+    "numpy==2.5.3",
+    "pandas==3.0.5",
+    "scipy==1.18.1",
+    "yfinance==1.7.0",
+    "plotly==7.1.0",
+    "streamlit==1.66.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# Turn warnings from our own code into errors so problems can't hide.
+filterwarnings = [
+    "error::RuntimeWarning:quantedge.*",
+]

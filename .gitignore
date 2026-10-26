@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.streamlit/secrets.toml
+.DS_Store
+# Downloaded market data snapshots (keep out of git unless you mean to share them)
+data_cache/

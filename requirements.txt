@@ -1,0 +1,9 @@
+# Exact versions verified with Python 3.13 (requires Python >= 3.12).
+# Install with:  pip install -r requirements.txt && pip install -e .
+numpy==2.5.3
+pandas==3.0.5
+scipy==1.18.1
+yfinance==1.7.0
+plotly==7.1.0
+streamlit==1.66.1
+pytest==9.1.1

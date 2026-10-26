@@ -1,0 +1,3 @@
+# Opt out of Streamlit usage telemetry by default (users can re-enable).
+[browser]
+gatherUsageStats = false
