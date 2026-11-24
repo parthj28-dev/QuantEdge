@@ -1,4 +1,4 @@
-# QuantEdge — Architecture, Formulas & Build Plan
+# QuantEdge v3.0 — Architecture, Formulas & Design Decisions
 
 This document is the design contract for the project. Every module, formula and
 convention used in the code is defined here first, so the code can be checked
@@ -16,13 +16,19 @@ against it (and so you can explain it in an interview without reading code).
            │
    charts.py              (Plotly figure builders — pure functions, no Streamlit)
            │
+   valuation.py, technical.py, performance.py   (v3: FA, TA, portfolio performance measurement)
+           │
    backtest.py            (walk-forward simulation)
            │
-   optimize.py, frontier.py, capm.py   (portfolio math)
+   estimators.py, riskbased.py, frontier.py   (v2: robust inputs, risk-based portfolios)
+           │
+   optimize.py, capm.py   (constrained optimisation, CAPM regression)
+           │
+   indicators.py          (v2.1: simple moving averages, trend signals)
            │
    metrics.py             (returns, risk, performance statistics)
            │
-   data.py                (fetch + validate prices)
+   data.py                (fetch + validate prices; v3: OHLCV for one ticker)
            │
    config.py, exceptions.py (constants and error types)
    ```
@@ -33,15 +39,20 @@ against it (and so you can explain it in an interview without reading code).
 
 3. **Fail loudly, never fabricate.** Missing or invalid data is *reported* or
    *raised*, never forward-filled, zero-filled or interpolated behind your back.
-   Undefined statistics (e.g. a Sharpe ratio when volatility is zero) are
-   returned as `NaN` — "undefined" — never as `0` or `inf`.
+   Undefined statistics (e.g. a Sharpe ratio when volatility is zero, RSI over a
+   flat window, an implied price from a negative metric) are returned as `NaN` —
+   "undefined" — never as `0` or `inf`.
 
-4. **Dependency injection for the network.** `fetch_prices` accepts a
-   `downloader` argument. Production uses yfinance; tests pass a fake that
-   returns a DataFrame shaped like yfinance's output. The test suite therefore
+4. **Dependency injection for the network.** `fetch_prices` and `fetch_ohlcv`
+   accept a `downloader` argument. Production uses yfinance; tests pass a fake
+   that returns a DataFrame shaped like yfinance's output. The test suite therefore
    never touches the internet and is fully reproducible.
 
 5. **One set of conventions** (Section 3), defined once in `config.py`.
+
+6. **Textbook-checked.** The v3 modules (valuation, technical, performance) are
+   tested against the worked examples in the SAPM course lectures, so every
+   formula reproduces a number a student can check by hand.
 
 ---
 
@@ -50,35 +61,33 @@ against it (and so you can explain it in an interview without reading code).
 ```
 quantedge/
 ├── README.md                 setup, usage, formulas summary, limitations
+├── CHANGELOG.md              release notes
+├── LICENSE                   MIT
 ├── pyproject.toml            package metadata, pinned deps, pytest config
-├── requirements.txt          exact pinned versions for a fresh environment
-├── .gitignore
+├── requirements.txt          exact pinned versions (+ the package itself, for app hosts)
+├── .github/workflows/tests.yml   CI: install from requirements.txt, run pytest
+├── .streamlit/config.toml    usage telemetry off by default
 ├── docs/
 │   └── ARCHITECTURE.md       this file
 ├── src/quantedge/
-│   ├── __init__.py
 │   ├── config.py             constants: 252 trading days, tolerances, defaults
-│   ├── exceptions.py         DataError, InsufficientDataError, OptimizationError
-│   ├── data.py               [Stage 1] ticker parsing, yfinance fetch, CSV load, validation
-│   ├── metrics.py            [Stage 1] returns, annualisation, vol, Sharpe, drawdown, corr/cov
-│   ├── capm.py               [Stage 2] beta / alpha regression, CAPM expected returns
-│   ├── optimize.py           [Stage 3] min-variance and max-Sharpe (SciPy SLSQP)
-│   ├── frontier.py           [Stage 3] efficient frontier by repeated constrained solves
-│   ├── backtest.py           [Stage 4] walk-forward backtest, costs, drift, no look-ahead
-│   └── charts.py             [Stage 5] Plotly figures (allocation, frontier, heatmap, equity)
+│   ├── exceptions.py         DataError, InsufficientDataError, OptimizationError, EstimationError
+│   ├── data.py               ticker parsing, yfinance fetch, CSV load, validation; OHLCV (v3)
+│   ├── metrics.py            returns, annualisation, vol, Sharpe, drawdown, corr/cov
+│   ├── indicators.py         [v2.1] SMA, trend status, golden/death crosses
+│   ├── capm.py               beta / alpha regression, CAPM expected returns
+│   ├── optimize.py           min-variance and max-Sharpe (SciPy SLSQP)
+│   ├── estimators.py         [v2] Ledoit-Wolf covariance, Black-Litterman returns
+│   ├── riskbased.py          [v2] risk contributions, inverse vol, risk parity, max diversification
+│   ├── frontier.py           efficient frontier by repeated constrained solves
+│   ├── backtest.py           walk-forward backtest, costs, drift, cash, strategy registry
+│   ├── valuation.py          [v3] DDM, PVGO, FCFF/FCFE DCF, justified P/E, peer multiples
+│   ├── technical.py          [v3] EMA, Bollinger, MACD, RSI, signals, candlesticks, TRIN, volume
+│   ├── performance.py        [v3] Sharpe, Treynor, Jensen, IR, M², diversification, market timing
+│   └── charts.py             Plotly figures
 ├── app/
-│   └── streamlit_app.py      [Stage 5] dashboard — orchestration and display only
-├── .streamlit/config.toml    usage telemetry off by default
-└── tests/
-    ├── conftest.py           deterministic synthetic fixtures (clearly test-only)
-    ├── test_data.py
-    ├── test_metrics.py
-    ├── test_capm.py
-    ├── test_optimize.py
-    ├── test_frontier.py
-    ├── test_backtest.py
-    ├── test_charts.py        figures contain exactly the data given; layering rule
-    └── test_app.py           headless app runs (streamlit.testing) via CSV upload
+│   └── streamlit_app.py      dashboard — orchestration and display only (11 tabs)
+└── tests/                    pytest suite (one file per module + headless app tests)
 ```
 
 The `src/` layout forces the package to be *installed* (`pip install -e .`)
@@ -90,7 +99,7 @@ before tests run, which catches packaging mistakes that a flat layout hides.
 
 | Item | Convention |
 |---|---|
-| Price series | Adjusted close (splits **and** dividends), daily |
+| Price series | Adjusted close (splits **and** dividends), daily. Candlesticks use the unadjusted session OHLC. |
 | Return type | **Simple** returns $r_t = P_t / P_{t-1} - 1$ |
 | Trading days per year | $N = 252$ (`config.TRADING_DAYS_PER_YEAR`) |
 | Risk-free input | Annual **effective** rate, e.g. `0.065` for 6.5 % |
@@ -99,20 +108,19 @@ before tests run, which catches packaging mistakes that a flat layout hides.
 | Expected return (μ) for optimisation | Arithmetic mean × $N$ |
 | Realised growth for reporting | CAGR (geometric) |
 | Volatility | Sample std (ddof = 1) × $\sqrt{N}$ |
-| Covariance | Sample covariance × $N$ |
+| Covariance | Sample covariance × $N$ (or Ledoit-Wolf, same units) |
+| Other frequencies (performance tab) | Daily returns compounded to W/M; annualise with $P$ = 252 / 52 / 12 |
 | Missing prices | Dates where any selected series is missing are **dropped and reported**; never filled |
+| Valuation inputs | Per-share amounts and decimal rates; no market data needed |
 
 **Why simple returns, not log returns?** A portfolio's return is a weighted sum
 of *simple* asset returns: $r_p = \sum_i w_i r_i = w^\top r$. That linearity is
 what makes $w^\top \mu$ and $w^\top \Sigma w$ correct, so mean–variance
-optimisation must use simple returns. (Log returns add up nicely *over time*
-but not *across assets*.)
+optimisation must use simple returns.
 
 **Why two annual return numbers?** The arithmetic mean × 252 is the right input
-for the optimiser (it's the expectation of a one-period return). CAGR is what
-an investor actually experienced. CAGR ≤ arithmetic mean, roughly
-CAGR ≈ μ − σ²/2 — so a volatile asset can have a high average return and a poor
-compounded return. The dashboard shows both and labels them.
+for the optimiser. CAGR is what an investor actually experienced;
+roughly CAGR ≈ μ − σ²/2. The dashboard shows both and labels them.
 
 ---
 
@@ -123,156 +131,156 @@ compounded return. The dashboard shows both and labels them.
 | Quantity | Formula |
 |---|---|
 | Daily simple return | $r_t = \dfrac{P_t}{P_{t-1}} - 1$ |
-| Annualised arithmetic return | $\mu = N \cdot \bar r$, where $\bar r = \frac1T\sum_t r_t$ |
+| Annualised arithmetic return | $\mu = N \cdot \bar r$ |
 | CAGR | $\left(\prod_{t=1}^{T}(1+r_t)\right)^{N/T} - 1$ |
-| Annualised volatility | $\sigma = \sqrt{N}\cdot s$, $s = \sqrt{\frac{1}{T-1}\sum_t (r_t-\bar r)^2}$ |
+| Annualised volatility | $\sigma = \sqrt{N}\cdot s$, $s$ = sample std of daily returns |
 | Sharpe ratio | $S = \sqrt{N}\cdot \dfrac{\overline{r - r_f^{d}}}{s(r - r_f^{d})}$ — `NaN` if $s \approx 0$ |
 | Wealth index | $W_0 = 1,\; W_t = \prod_{k\le t}(1+r_k)$ |
 | Drawdown | $D_t = W_t / \max_{k \le t} W_k - 1$ (with $W_0=1$ included) |
 | Maximum drawdown | $\text{MDD} = \min_t D_t$ (≤ 0) |
-| Covariance (annual) | $\Sigma = N \cdot \widehat{\text{Cov}}(r)$ |
 | Correlation | $\rho_{ij} = \Sigma_{ij} / (\sigma_i \sigma_j)$ — `NaN` for a zero-variance asset |
 
-Including $W_0 = 1$ in the running peak matters: if the asset falls on day 1,
-that loss is a drawdown from the starting capital.
+### 4.2 CAPM (`capm.py`)
 
-### 4.2 CAPM (`capm.py`, Stage 2)
+OLS on aligned **excess** returns: $r_{i,t} - r_f^{d} = \alpha_i + \beta_i\,(r_{m,t} - r_f^{d}) + \varepsilon_t$.
+Outputs: $\hat\beta$, $\alpha^{\text{ann}} = N\hat\alpha$, $R^2$, std. error of beta,
+residual volatility $\sqrt{N \cdot \text{SSR}/(T-2)}$. CAPM expected return
+$E[R_i] = r_f^{\text{ann}} + \beta_i \cdot \text{MRP}$, with MRP historical or user-supplied.
+With the historical premium, *historical mean = CAPM expected return + annual alpha* exactly (tested).
 
-Regression on aligned **excess** returns (same dates for asset and benchmark):
+### 4.3 Optimisation (`optimize.py`)
 
-$$ r_{i,t} - r_f^{d} = \alpha_i + \beta_i\,(r_{m,t} - r_f^{d}) + \varepsilon_t $$
+Long-only, fully invested, capped: $\sum_i w_i = 1,\ 0 \le w_i \le c_i$ (feasible only if $\sum c_i \ge 1$).
+Minimum variance $\min w^\top\Sigma w$; maximum Sharpe $\max (w^\top\mu - r_f^{\text{ann}})/\sqrt{w^\top\Sigma w}$
+(four starting points, non-convex); target return for the frontier. SciPy SLSQP with analytic gradients;
+every solution re-verified independently of `res.success`.
 
-$$ \beta_i = \frac{\text{Cov}(r_i - r_f,\; r_m - r_f)}{\text{Var}(r_m - r_f)}, \qquad
-\alpha_i^{\text{annual}} = N \cdot \alpha_i $$
+### 4.4 Efficient frontier (`frontier.py`)
 
-With $x_t = r_{m,t} - r_f^d$, $y_t = r_{i,t} - r_f^d$ and $T$ aligned dates:
+Min-variance return to the highest return achievable under the caps; $K$ target-return solves,
+warm-started; failed targets recorded, not hidden.
 
-| Output | Formula |
+### 4.5 Backtest (`backtest.py`)
+
+* **No look-ahead:** on rebalance date $t$ the strategy receives only a copy of the
+  last $L$ returns up to and including $t$; new weights earn from $t+1$.
+* **Drift:** $w_{i,t+1} = w_{i,t}(1 + r_{i,t+1}) / (1 + r_{p,t+1})$.
+* **Costs:** turnover $\tau_t = \sum_{i \in \text{assets}} |w^{\text{target}}_{i} - w^{\text{drift}}_{i}|$, value $\times (1 - c\,\tau_t)$.
+* **Cash (v2.1):** reserved key `CASH` earns $r_f^d$ from `cash_rate`; turnover counts risky assets
+  only, so the initial purchase costs $c \times$ the invested fraction.
+* **Strategies (8):** equal weight, min variance, max Sharpe, inverse volatility, risk parity,
+  max diversification (each with sample or Ledoit-Wolf covariance), equal weight + SMA filter,
+  risk parity + SMA filter. Registry `STRATEGY_FACTORIES[name](rf, cap, cov_method, sma_window)`.
+* **Look-ahead tests:** spy strategy, poisoned future, same-day trap.
+
+### 4.6 Charts and dashboard (`charts.py`, `app/`)
+
+Pure Plotly figure builders with one validated palette; scatter charts colour ≤ 3 series; every chart
+has a table next to it in the app. The dashboard only orchestrates; each section catches
+`QuantEdgeError` and shows the message while the rest of the page renders. A test enforces that
+importing any package module never imports Streamlit.
+
+Tabs: Overview · Risk · CAPM · Estimation · Optimisation · Backtest · Trend · Technical · Valuation ·
+Performance · Methodology. Valuation and the summary-statistics mode of Performance work without
+loading any market data.
+
+### 4.7 Robust estimation (`estimators.py`, v2)
+
+**Ledoit-Wolf shrinkage.** Demeaned daily returns $X$ ($T \times n$), $S = X^\top X / T$,
+target $F = m I$, $m = \operatorname{tr}(S)/n$:
+
+$$ \Sigma_{LW} = (1-\delta) S + \delta F, \qquad
+\delta = \min\!\Big(1,\ \frac{\phi}{T\,\gamma}\Big),\quad
+\phi = \sum_{ij}\Big[\tfrac1T \sum_t x_{ti}^2 x_{tj}^2 - S_{ij}^2\Big],\quad
+\gamma = \lVert S - F \rVert_F^2 $$
+
+rescaled to the unbiased and annual convention. Intensity verified against scikit-learn
+reference values (frozen in the tests).
+
+**Black-Litterman.** $\Pi = \delta\,\Sigma\, w_{mkt}$; views $P\mu = Q$ with confidence $c_k \in (0,1]$,
+$\Omega_{kk} = (1/c_k - 1)(P\tau\Sigma P^\top)_{kk}$;
+$\mu_{BL} = \Pi + \tau\Sigma P^\top (P\tau\Sigma P^\top + \Omega)^{-1}(Q - P\Pi)$,
+$\Sigma_{BL} = \Sigma + \tau\Sigma - \tau\Sigma P^\top (P\tau\Sigma P^\top + \Omega)^{-1} P \tau\Sigma$.
+Views are total returns converted with $Q - r_f^{\text{ann}}\sum_j P_{kj}$. Risk aversion manual or
+implied $\delta = (E[R_m]-r_f)/\sigma_m^2$ (must be positive; the app falls back to manual).
+Tested: no views ⇒ prior and $(1+\tau)\Sigma$; max-Sharpe on the prior recovers $w_{mkt}$; $c=1$ matches
+a view exactly, $c=0.5$ moves halfway; duplicate certain views raise `EstimationError`.
+
+### 4.8 Risk-based portfolios (`riskbased.py`, v2)
+
+Risk share$_i = w_i(\Sigma w)_i / w^\top\Sigma w$.
+Inverse volatility (closed form, water-filled caps); risk parity by Newton's method on
+$\tfrac12 y^\top\Sigma y - \tfrac1n\sum\ln y_i$ (damped while the Newton decrement exceeds $10^{-8}$,
+then full steps; a 100-problem stress test guards convergence), with a capped least-squares fallback
+and a note when caps make equal shares impossible; maximum diversification as max-Sharpe with
+$\mu = \sigma$, $r_f = 0$. Identities tested: two assets ⇒ ERC = inverse vol; equal correlations ⇒
+all three coincide; uncorrelated ⇒ max diversification = inverse vol.
+
+### 4.9 Moving averages and the trend filter (`indicators.py`, v2.1)
+
+$\text{SMA}_n(t) = \frac1n\sum_{k=0}^{n-1} P_{t-k}$; first $n-1$ values undefined. Above trend means
+$P_t > \text{SMA}_n(t)$ strictly. Golden cross: fast SMA moves from $\le$ to $>$ the slow SMA.
+Inside the backtest $P_t/\text{SMA}_n(t)$ is computed exactly from relative prices over the last
+$n-1$ returns. `sma_trend_filter(base, n)` keeps each asset's base weight while above trend and moves
+the rest to cash (not redistributed).
+
+### 4.10 Fundamental analysis (`valuation.py`, v3, lectures 22–25)
+
+| Model | Formula |
 |---|---|
-| Beta | $\hat\beta = \sum (x-\bar x)(y-\bar y) \,/\, \sum (x-\bar x)^2$ |
-| Alpha (daily, annual) | $\hat\alpha = \bar y - \hat\beta \bar x$, $\;\alpha^{\text{ann}} = N\hat\alpha$ |
-| $R^2$ | $1 - \text{SSR}/\text{SST}$ — `NaN` for a zero-variance asset |
-| Std. error of beta | $\sqrt{\text{SSR}/(T-2) \,/\, \sum (x-\bar x)^2}$ |
-| Residual (idiosyncratic) volatility | $\sqrt{N \cdot \text{SSR}/(T-2)}$ |
+| Holding-period return | $HPR = (D_1 + P_1 - P_0)/P_0$; signal Buy if $HPR > k$ |
+| Required return | $k = r_f + \beta\,\text{MRP}$, or implied $k = D_1/P_0 + g$ |
+| Sustainable growth | $g = b \times ROE$ |
+| Zero growth | $V_0 = D/k$ |
+| Gordon | $V_0 = D_1/(k-g)$, needs $k > g$ |
+| Multistage DDM | $V_0 = \sum_{t=1}^{T} D_t/(1+k)^t + V_T/(1+k)^T$, $V_T = D_{T+1}/(k - g)$ |
+| Two-stage closed form | $\frac{D_1}{k-g_1}\Big[1-\big(\frac{1+g_1}{1+k}\big)^N\Big] + \frac{D_{N+1}}{(k-g_2)(1+k)^N}$ |
+| Payout/ROE-driven DDM | $E_t = E_{t-1}(1 + b_{t-1}ROE_{t-1})$, $D_t = (1-b_t)E_t$ |
+| PVGO | $P_0 = E_1/k + PVGO$ |
+| FCFF | $EBIT(1-t) + \text{Dep} - \text{Capex} - \Delta NWC$ |
+| FCFE | $FCFF - \text{Int}(1-t) + \text{net borrowing}$ $= NI - (\text{Capex}-\text{Dep}) - \Delta WC + \text{new debt} - \text{repaid}$ |
+| Equity from firm value | $(V_{firm} - \text{net debt})/\text{shares}$ |
+| Justified P/E | forward $\frac{1-b}{k - b\,ROE}$, trailing $\frac{(1-b)(1+g)}{k-g}$, FCFE $\frac{FCFE_1/E_1}{k-g}$ |
+| PEG | $(P/E)/(100\,g)$ |
+| Peer multiples | implied price = multiple × own metric; EV/EBITDA via the equity bridge |
 
-CAPM expected return (arithmetic annual, same units as the optimiser's μ):
+The payout/ROE model makes a payout change move the dividend immediately and the growth rate one year
+later (lecture 22, problem 2). Lecture examples reproduced exactly in the tests: 3.92, 25, 54, 28.89,
+~30.42, ₹168 (sell), 50.07 (sell), PVGO −11.11, P/E 11.43 and value 31.14.
 
-$$ E[R_i] = r_f^{\text{ann}} + \beta_i \cdot \text{MRP}, \qquad r_f^{\text{ann}} = N \cdot r_f^{d} $$
+### 4.11 Technical analysis (`technical.py`, v3, lectures 26–29)
 
-The market risk premium MRP $= E[R_m]-r_f$ is configurable: either the
-benchmark's historical value $N \cdot \overline{(r_m - r_f^d)}$ over the same
-dates, or a user-supplied number (e.g. 6 %). With the historical premium the
-identity *historical mean return = CAPM expected return + annual alpha* holds
-exactly (tested).
+| Indicator | Definition |
+|---|---|
+| EMA | $EMA_t = EMA_{t-1} + \frac{2}{n+1}(P_t - EMA_{t-1})$, seeded with the first full SMA |
+| Bollinger | $SMA_n \pm k\,\sigma_n$ (population σ), $n=20, k=2$; %B and bandwidth |
+| MACD | $EMA_{12} - EMA_{26}$; signal = 9-day **SMA** of MACD (lecture; EMA optional); histogram |
+| RSI | $100 - 100/(1+RS)$, RS = average gain / average loss over 14 changes (simple; Wilder optional) |
+| Support / resistance | min / max of the **previous** $n$ prices (no look-ahead) |
+| TRIN | $(A/D \text{ issues}) / (A/D \text{ volume})$ |
 
-Edge cases: a zero-variance benchmark raises `DataError` (beta undefined for
-every asset); dates not shared by asset and benchmark are dropped and counted;
-a negative historical premium and low $R^2$ (< 0.10) are flagged in `notes`.
+Signals: MACD crossing its signal line or zero; RSI entering overbought (> 70) or oversold (< 30);
+close breaking outside the bands; band squeeze flagged when bandwidth is in its lowest decile.
+Candlesticks (hammer, hanging man, doji, engulfing, harami, morning/evening star) are detected on
+validated OHLC with a prior-trend filter; single-candle patterns are marked as needing confirmation.
 
-### 4.3 Optimisation (`optimize.py`, Stage 3)
+### 4.12 Portfolio performance measurement (`performance.py`, v3, lectures 30–32)
 
-Let $w \in \mathbb{R}^n$, $\mu$ annual expected returns, $\Sigma$ annual covariance.
-Common constraints (long-only, fully invested, capped):
+| Measure | Formula |
+|---|---|
+| Sharpe | $(\bar R - \bar R_f)/\sigma$ (σ of excess returns in series mode, as in `metrics`) |
+| Treynor | $(\bar R - \bar R_f)/\beta$ |
+| Jensen alpha | intercept of $R_t - R_{f,t} = \alpha + \beta(R_{m,t} - R_{f,t}) + e_t$, with t-statistic |
+| Information ratio | $(\bar R - \bar R_b)/\sigma(R - R_b)$; tracking error $\sigma(R - R_b)$ |
+| M² | $R_f + S \times \sigma_M$ |
+| Diversification | systematic $\beta^2\sigma_M^2$, unsystematic $\sigma^2 - \beta^2\sigma_M^2$, $R^2$ |
+| Treynor-Mazuy | $r_p - r_f = a + b_1 x + b_2 x^2 + e$, $x = r_M - r_f$ |
+| Henriksson-Merton | $r_p - r_f = a + b_1 x + b_2 x D + e$, $D = 1$ if $x > 0$ |
 
-$$ \sum_i w_i = 1, \qquad 0 \le w_i \le c_i $$
-
-Caps $c_i$ may be one number for all assets or one per asset. Feasibility check
-before solving: $\sum_i c_i \ge 1$ (for a single cap, $n \cdot c \ge 1$),
-otherwise `OptimizationError` says how high the cap must be.
-
-Inputs are validated first: matching labels, finite values, $\Sigma$ symmetric
-and positive semi-definite (smallest eigenvalue $\ge -10^{-10}\max|\Sigma|$).
-
-| Problem | Objective | Gradient |
-|---|---|---|
-| Minimum variance | $\min_w w^\top\Sigma w$ | $2\Sigma w$ |
-| Maximum Sharpe | $\max_w \dfrac{w^\top e}{\sigma(w)}$, $e = \mu - r_f^{\text{ann}}$ | $\dfrac{e}{\sigma} - \dfrac{(w^\top e)\,\Sigma w}{\sigma^3}$ |
-| Target return | $\min_w w^\top\Sigma w$ s.t. $w^\top\mu = R$ | $2\Sigma w$ |
-
-with $\sigma(w) = \sqrt{w^\top\Sigma w}$ and $r_f^{\text{ann}} = N \cdot r_f^{d}$.
-
-Solved with SciPy `minimize(method="SLSQP")` using these analytic gradients.
-
-* Minimum variance is convex (any local minimum is global).
-* Maximum Sharpe is a ratio, not convex in general, so it is solved from four
-  starting points (near-equal weights, GMV, max-return corner, best stand-alone
-  Sharpe) and the best verified solution is kept.
-* Every solution is **re-verified** independently of `res.success`: sum, bounds
-  and target within $10^{-8}$; numerical dust is clipped, real violations raise.
-* Max-Sharpe raises if any asset, or any feasible combination, has zero
-  volatility (the ratio is then unbounded). The combination check uses the GMV
-  solution: since that problem is convex, GMV volatility = 0 exactly when a
-  zero-risk portfolio exists.
-* If no feasible portfolio beats the risk-free rate, the result is returned
-  with a note that its Sharpe ratio is non-positive.
-* Achievable return range: the min/max of $w^\top\mu$ over the constraint set
-  is found exactly by filling assets in order of μ up to their caps.
-
-### 4.4 Efficient frontier (`frontier.py`, Stage 3)
-
-1. Solve min-variance → lowest frontier return $R_{\min}$.
-2. Highest achievable return under the caps, $R_{\max}$: fill the
-   highest-μ assets up to $w_{\max}$ until the budget is used (exact for this
-   constraint set).
-3. For $K$ targets $R_k \in [R_{\min}, R_{\max}]$ solve
-   $\min_w w^\top\Sigma w$ s.t. $w^\top\mu = R_k$ plus the common constraints.
-4. Warm-start each solve from the previous solution; record (not hide)
-   any target that fails.
-
-### 4.5 Backtest (`backtest.py`, Stage 4)
-
-Timeline rule (**no look-ahead**): on a rebalance date $t$ the strategy may use
-only returns dated $\le t$ (i.e. prices up to the close of $t$). New weights
-earn returns from $t+1$ onward.
-
-* **Estimation window:** a *copy* of the last $L$ daily returns up to and
-  including $t$ (rows $t-L+1 \dots t$). The strategy never receives the full table.
-* **Initial allocation:** at the close of the first day with $L$ returns of
-  history (row $L-1$), bought from cash ($\tau = 1$). Performance starts the next day.
-* **Rebalance schedule:** `"W"`, `"M"`, `"Q"` (last trading day of each
-  week/month/quarter in the data), every $H$ trading days, or `None`
-  (buy and hold). No trade on the final day.
-* **Weight drift between rebalances:**
-  $w_{i,t+1} = \dfrac{w_{i,t}(1 + r_{i,t+1})}{1 + r_{p,t+1}}$
-* **Transaction cost:** turnover $\tau_t = \sum_i |w^{\text{target}}_{i} - w^{\text{drift}}_{i}|$
-  (buys + sells), value $\times (1 - c\,\tau_t)$ with $c$ = `cost_bps`/10 000
-  per unit traded. A full switch between two assets has $\tau = 2$. Measuring
-  $\tau$ on pre-cost value is an $O(c^2)$ approximation.
-* **Identity (tested):** wealth with costs = wealth without costs ×
-  $\prod_k (1 - c\,\tau_k)$, because proportional costs don't alter the weight path.
-* **Failed rebalance:** keep drifted weights, record date and reason in
-  `skipped_rebalances`; a failed *first* allocation raises.
-* **Strategies:** equal weight, fixed weights, min-variance, max-Sharpe (with
-  caps); any function `window -> weights` can be plugged in.
-* **Look-ahead tests:** (1) a spy strategy proves the last row seen equals the
-  decision date; (2) poisoning returns after date $t$ leaves all weights and
-  returns up to $t$ unchanged; (3) a strategy that switches into a stock after
-  a +50 % day does not earn that +50 %.
-
-### 4.6 Charts and dashboard (`charts.py`, `app/`, Stage 5)
-
-**Charts** are pure functions returning Plotly figures; tests inspect the data
-inside each figure. Visual rules:
-
-* One validated categorical palette (light and dark steps validated separately
-  for colour-vision deficiency and contrast), assigned in fixed order.
-* Scatter charts colour at most 3 highlighted portfolios; assets are neutral
-  grey with direct labels. Line/bar/stacked charts allow up to 8 series; the
-  weights chart folds extras into "Other".
-* Correlation heatmap: fixed scale −1…+1, diverging blue/grey/red, values
-  printed in cells, NaN left blank and labelled "undefined" on hover.
-* Every chart has a table view next to it in the app (needed because two
-  light-mode colours are below 3:1 contrast).
-* The capital market line runs from $r_f^{\text{ann}}$ through the
-  highest-Sharpe highlighted portfolio (slope = its Sharpe ratio).
-
-**Dashboard** (`app/streamlit_app.py`) only orchestrates: sidebar inputs →
-`quantedge` functions → charts/tables. Each section is wrapped so a
-`QuantEdgeError` shows as a message in that section while the rest still
-renders. Network calls, the frontier and backtests are cached
-(`st.cache_data`); backtests run only when the form is submitted. Validated
-prices can be downloaded as CSV and re-uploaded to reproduce an analysis.
-Layering is enforced by a test: importing the package must not import Streamlit.
+Summary mode takes return/beta/σ per portfolio (the lecture problems). Series mode works at daily,
+weekly or monthly frequency over dates shared with the benchmark. Tested: lecture Treynor and Sharpe
+examples, P/Q/R/S exercise, beta/alpha/Sharpe identical to `capm` and `metrics`, Henriksson-Merton
+recovers both betas exactly on noiseless data, collinear regressors raise `EstimationError`.
 
 ---
 
@@ -281,46 +289,49 @@ Layering is enforced by a test: importing the package must not import Streamlit.
 | Situation | Behaviour |
 |---|---|
 | Ticker returns no data | Excluded, listed in `report.missing_tickers` |
-| All tickers fail | `DataError` |
+| All tickers fail / network failure | `DataError` |
 | NaN inside a series | Those dates dropped, count reported per ticker |
-| Price ≤ 0 or ±inf | `DataError` naming ticker and date |
-| Duplicate dates | `DataError` |
-| Too few observations | `InsufficientDataError` naming the limiting ticker |
-| Zero-volatility asset | Sharpe/correlation = `NaN`; flagged by `zero_volatility_assets()` |
-| Infeasible caps | `OptimizationError` before solving |
-| Solver fails / violates constraints | `OptimizationError` with SciPy's message |
-| Network failure | `DataError` wrapping the original exception |
-
-The UI catches `QuantEdgeError` subclasses and shows the message; it never
-shows a chart built on partial, silently-repaired data.
+| Price ≤ 0 or ±inf, duplicate dates | `DataError` |
+| Too few observations | `InsufficientDataError` saying how many are needed |
+| Zero-volatility asset | Sharpe/correlation = `NaN`; max-Sharpe and risk-based methods raise `OptimizationError` |
+| Infeasible caps / solver failure | `OptimizationError` |
+| Invalid BL views, market weights, δ ≤ 0 | `EstimationError` naming the problem |
+| Caps make equal risk contributions impossible | Closest feasible solution + note |
+| SMA window longer than the data / lookback | `InsufficientDataError` |
+| Data column named `Cash` in a backtest | `DataError` (reserved name) |
+| A strategy cannot start in the app | That strategy is reported; the others run |
+| $k \le g$ in any growing-perpetuity model | `EstimationError` (value would be infinite) |
+| Non-numeric / non-finite valuation input, payout outside 0–1 | `EstimationError` |
+| Multiple whose metric is missing or ≤ 0 | Implied price `NaN` with a note (not 0) |
+| Flat RSI window | `NaN` (undefined), not 50 |
+| OHLC with High < max(O, C), Low > min(O, C), gaps in prices | `DataError`; incomplete candles dropped and counted when downloading |
+| Market never below rf (Henriksson-Merton) | `EstimationError` (regressors collinear) |
 
 ---
 
-## 6. Implementation stages
+## 6. Releases
 
-| Stage | Deliverable | Tests |
+| Release | Deliverable | Tests |
 |---|---|---|
-| 1 | Scaffold, pinned deps, `config`, `exceptions`, `data`, `metrics` | data validation, every metric vs hand-computed values |
-| 2 | `capm` | β recovers a known slope, alignment, zero-variance benchmark |
-| 3 | `optimize`, `frontier` | constraints hold, caps respected, infeasible caps, 2-asset analytic min-var |
-| 4 | `backtest` | costs, drift, rebalancing dates, no look-ahead |
-| 5 | `charts`, Streamlit app | figure builders return valid figures; app smoke test |
-| 6 | README, CI workflow, fresh-environment check | full suite in a clean venv |
+| v1.0.0 | Data, metrics, CAPM, optimisation, frontier, backtest, charts, dashboard | 211 |
+| v2.0 / v2.1 | Ledoit-Wolf, Black-Litterman, risk-based portfolios, SMA indicators, cash, trend filter | — |
+| **v3.0.0** | v2.x features rebuilt from this specification (the v2.x code was never published), plus valuation, technical analysis, performance measurement, OHLCV data, 11-tab dashboard | 369 |
 
 ---
 
 ## 7. Known limitations (carried into README)
 
-* Historical estimates of μ are extremely noisy; optimiser output is highly
-  sensitive to them ("error maximisation"). Weight caps and CAPM-based μ are
-  partial mitigations, not cures.
-* Sample covariance is unstable when the number of assets is large relative to
-  the number of observations. (Shrinkage estimators are a natural extension.)
-* yfinance is an unofficial interface to Yahoo Finance; data can change,
-  be revised, or be unavailable. For reproducible research, save the validated
-  prices to CSV and reload them.
-* Mixing exchanges with different holiday calendars (e.g. NSE and NYSE)
-  drops non-common dates; returns on the next common date then span the gap.
-* Backtests assume execution at the closing price, no slippage beyond the
-  fixed cost rate, no taxes, and fractional shares.
+* Historical estimates of μ are extremely noisy; optimiser output is highly sensitive to them.
+  Caps, CAPM, Black-Litterman and shrinkage are mitigations, not cures.
+* Black-Litterman's equilibrium is only as good as the market weights supplied; the dashboard's
+  equal-weight default is a placeholder.
+* Ledoit-Wolf shrinks towards a scaled identity only.
+* yfinance is an unofficial interface to Yahoo Finance; save validated prices to CSV for reproducibility.
+* Mixing exchanges with different holiday calendars drops non-common dates.
+* Backtests assume execution at the close, a fixed cost rate, no taxes and fractional shares.
+* Technical-analysis signals are descriptive; they are not backtested here and are not evidence of an edge.
+  Candlestick rules use fixed thresholds that analysts apply with judgement.
+* Valuation outputs depend entirely on the growth, payout and discount-rate assumptions entered; the
+  terminal value usually dominates.
+* Market-timing regressions need many periods and both up and down markets; daily data adds noise.
 * Past performance is research data, not a forecast.
