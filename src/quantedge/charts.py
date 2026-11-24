@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from .backtest import BacktestResult
 from .frontier import FrontierResult
@@ -90,25 +91,49 @@ def _require(obj, what: str) -> None:
 # --------------------------------------------------------------------------- #
 # Allocations
 # --------------------------------------------------------------------------- #
+def grouped_bar(frame: pd.DataFrame | pd.Series, *, mode: str = "light", title: str = "",
+                y_title: str = "", pct: bool = True) -> go.Figure:
+    """Grouped bars: rows on the x-axis, one colour per column."""
+    theme = _theme(mode)
+    frame = frame.to_frame() if isinstance(frame, pd.Series) else frame
+    _require(frame, "values")
+    if frame.shape[1] > MAX_CATEGORICAL:
+        raise ValueError(f"At most {MAX_CATEGORICAL} series can be compared in one chart.")
+    fmt = "%{y:.1%}" if pct else "%{y:.3f}"
+    fig = go.Figure()
+    for i, column in enumerate(frame.columns):
+        fig.add_bar(
+            x=[str(a) for a in frame.index], y=frame[column].to_numpy(dtype=float), name=str(column),
+            marker=dict(color=theme["series"][i], line=dict(width=0)),
+            hovertemplate="%{x}<br>" + f"{column}: " + fmt + "<extra></extra>",
+        )
+    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.08, barcornerradius=4)
+    _layout(fig, theme, title, "", y_title, y_pct=pct, legend=frame.shape[1] > 1)
+    return fig
+
+
 def allocation_bar(weights: pd.DataFrame | pd.Series, *, mode: str = "light",
                    title: str = "Portfolio weights") -> go.Figure:
     """Grouped bars: assets on the x-axis, one colour per portfolio (columns of `weights`)."""
-    theme = _theme(mode)
     frame = weights.to_frame() if isinstance(weights, pd.Series) else weights
     _require(frame, "weights")
     if frame.shape[1] > MAX_CATEGORICAL:
         raise ValueError(f"At most {MAX_CATEGORICAL} portfolios can be compared in one chart.")
-    fig = go.Figure()
-    for i, column in enumerate(frame.columns):
-        fig.add_bar(
-            x=[str(a) for a in frame.index], y=frame[column].to_numpy(), name=str(column),
-            marker=dict(color=theme["series"][i], line=dict(width=0)),
-            hovertemplate="%{x}<br>" + f"{column}: " + "%{y:.1%}<extra></extra>",
-        )
-    fig.update_layout(barmode="group", bargap=0.25, bargroupgap=0.08, barcornerradius=4)
-    _layout(fig, theme, title, "", "Weight", y_pct=True, legend=frame.shape[1] > 1)
+    fig = grouped_bar(frame, mode=mode, title=title, y_title="Weight")
     fig.update_yaxes(rangemode="tozero")
     return fig
+
+
+def expected_returns_chart(table: pd.DataFrame, *, mode: str = "light") -> go.Figure:
+    """Expected returns of each asset under each estimator (columns), e.g. historical / CAPM / BL."""
+    return grouped_bar(table, mode=mode, title="Expected annual return by estimator",
+                       y_title="Expected return")
+
+
+def risk_contribution_chart(contrib: pd.DataFrame, *, mode: str = "light", title: str = "") -> go.Figure:
+    """Weight vs share of portfolio risk per asset (from riskbased.risk_contributions)."""
+    frame = contrib[["weight", "risk_share"]].rename(columns={"weight": "Weight", "risk_share": "Share of risk"})
+    return grouped_bar(frame, mode=mode, title=title or "Weight vs contribution to risk", y_title="Share")
 
 
 def allocation_pie(weights: pd.Series, *, mode: str = "light", title: str = "Allocation",
@@ -319,4 +344,172 @@ def drawdown_chart(results: Sequence[BacktestResult], *, benchmark: pd.Series | 
                         hovertemplate=f"{name}: " + "%{y:.1%}<extra></extra>")
     _layout(fig, theme, "Drawdown from previous peak", "", "Drawdown", y_pct=True)
     fig.update_layout(hovermode="x unified")
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Trend and technical analysis (v2.1, v3.0)
+# --------------------------------------------------------------------------- #
+def trend_chart(prices: pd.Series, smas: Mapping[str, pd.Series], *, events: pd.DataFrame | None = None,
+                mode: str = "light", title: str | None = None) -> go.Figure:
+    """Price with moving averages; golden crosses as up-triangles, death crosses as down-triangles."""
+    theme = _theme(mode)
+    _require(prices, "prices")
+    fig = go.Figure()
+    fig.add_scatter(x=prices.index, y=prices, name=str(prices.name or "Price"), mode="lines",
+                    line=dict(width=1.5, color=theme["ink_secondary"]),
+                    hovertemplate="Price %{y:,.2f}<extra></extra>")
+    for i, (label, line) in enumerate(smas.items()):
+        fig.add_scatter(x=line.index, y=line, name=label, mode="lines",
+                        line=dict(width=2, color=theme["series"][i]),
+                        hovertemplate=f"{label} " + "%{y:,.2f}<extra></extra>")
+    if events is not None and len(events):
+        for kind, symbol, color in (("golden cross", "triangle-up", theme["series"][2]),
+                                    ("death cross", "triangle-down", theme["series"][7])):
+            ev = events[events["event"] == kind]
+            if len(ev):
+                fig.add_scatter(x=ev["date"], y=ev["price"], name=kind.capitalize(), mode="markers",
+                                marker=dict(size=12, symbol=symbol, color=color,
+                                            line=dict(width=1, color="rgba(255,255,255,0.9)")),
+                                hovertemplate=kind + " %{x|%d %b %Y}<extra></extra>")
+    _layout(fig, theme, title or f"{prices.name}: price and moving averages", "", "Price")
+    fig.update_layout(hovermode="x unified")
+    return fig
+
+
+def technical_chart(prices: pd.Series, *, bands: pd.DataFrame, macd_frame: pd.DataFrame, rsi_line: pd.Series,
+                    ema_lines: Mapping[str, pd.Series] | None = None, rsi_levels: tuple[float, float] = (30, 70),
+                    events: pd.DataFrame | None = None, mode: str = "light") -> go.Figure:
+    """Three panels: price with Bollinger bands and EMAs; MACD with signal and histogram; RSI."""
+    theme = _theme(mode)
+    _require(prices, "prices")
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.55, 0.25, 0.20],
+                        vertical_spacing=0.04)
+    s = theme["series"]
+    fig.add_scatter(x=bands.index, y=bands["upper"], name="Upper band", mode="lines",
+                    line=dict(width=1, color=theme["muted"]), row=1, col=1,
+                    hovertemplate="Upper %{y:,.2f}<extra></extra>")
+    fig.add_scatter(x=bands.index, y=bands["lower"], name="Lower band", mode="lines", fill="tonexty",
+                    fillcolor="rgba(137,135,129,0.12)", line=dict(width=1, color=theme["muted"]), row=1, col=1,
+                    hovertemplate="Lower %{y:,.2f}<extra></extra>")
+    fig.add_scatter(x=bands.index, y=bands["middle"], name="Middle (SMA)", mode="lines",
+                    line=dict(width=1, dash="dot", color=theme["muted"]), row=1, col=1,
+                    hovertemplate="SMA %{y:,.2f}<extra></extra>")
+    fig.add_scatter(x=prices.index, y=prices, name=str(prices.name or "Price"), mode="lines",
+                    line=dict(width=1.8, color=theme["ink_secondary"]), row=1, col=1,
+                    hovertemplate="Price %{y:,.2f}<extra></extra>")
+    for i, (label, line) in enumerate((ema_lines or {}).items()):
+        fig.add_scatter(x=line.index, y=line, name=label, mode="lines", line=dict(width=1.6, color=s[3 + i]),
+                        row=1, col=1, hovertemplate=f"{label} " + "%{y:,.2f}<extra></extra>")
+    if events is not None and len(events):
+        for sig, symbol, color in (("bullish", "triangle-up", s[2]), ("bearish", "triangle-down", s[7])):
+            ev = events[(events["signal"] == sig) & (events["indicator"] != "MACD")]
+            ev = ev[ev["date"].isin(prices.index)]
+            if len(ev):
+                fig.add_scatter(x=ev["date"], y=prices.loc[ev["date"]].to_numpy(), mode="markers",
+                                name=f"{sig.capitalize()} RSI/band signal", text=ev["event"],
+                                marker=dict(size=10, symbol=symbol, color=color), row=1, col=1,
+                                hovertemplate="%{text}<extra></extra>")
+    hist = macd_frame["histogram"]
+    fig.add_bar(x=hist.index, y=hist, name="MACD histogram", row=2, col=1, showlegend=False,
+                marker=dict(color=np.where(hist.fillna(0) >= 0, s[2], s[7]), line=dict(width=0)),
+                hovertemplate="Histogram %{y:.3f}<extra></extra>")
+    fig.add_scatter(x=macd_frame.index, y=macd_frame["macd"], name="MACD", mode="lines",
+                    line=dict(width=1.6, color=s[0]), row=2, col=1, hovertemplate="MACD %{y:.3f}<extra></extra>")
+    fig.add_scatter(x=macd_frame.index, y=macd_frame["signal"], name="Signal", mode="lines",
+                    line=dict(width=1.6, color=s[1]), row=2, col=1, hovertemplate="Signal %{y:.3f}<extra></extra>")
+    fig.add_scatter(x=rsi_line.index, y=rsi_line, name="RSI", mode="lines", line=dict(width=1.6, color=s[6]),
+                    row=3, col=1, hovertemplate="RSI %{y:.1f}<extra></extra>")
+    for level in rsi_levels:
+        fig.add_hline(y=level, line=dict(width=1, dash="dash", color=theme["muted"]), row=3, col=1)
+    _layout(fig, theme, f"{prices.name}: Bollinger bands, MACD and RSI", "", "")
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="MACD", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    # Many series: legend below the panels so it never collides with the title.
+    fig.update_layout(hovermode="x unified", height=800, bargap=0, margin=dict(l=60, r=20, t=60, b=110),
+                      legend=dict(orientation="h", yanchor="top", y=-0.06, x=0))
+    return fig
+
+
+def candlestick_chart(ohlc: pd.DataFrame, *, patterns: pd.DataFrame | None = None, mode: str = "light",
+                      title: str = "Candlesticks") -> go.Figure:
+    """OHLC candles (green = close above open) with detected patterns marked above/below the bar."""
+    theme = _theme(mode)
+    _require(ohlc, "OHLC data")
+    up, down = theme["series"][2], theme["series"][7]
+    fig = go.Figure(go.Candlestick(x=ohlc.index, open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"],
+                                   close=ohlc["Close"], name="Price",
+                                   increasing=dict(line=dict(color=up), fillcolor=up),
+                                   decreasing=dict(line=dict(color=down), fillcolor=down)))
+    if patterns is not None and len(patterns):
+        for sig, symbol, color, col, shift in (("bullish", "triangle-up", up, "Low", 0.985),
+                                               ("bearish", "triangle-down", down, "High", 1.015),
+                                               ("neutral", "diamond", theme["muted"], "High", 1.015)):
+            p = patterns[patterns["signal"] == sig]
+            if len(p):
+                y = ohlc.loc[p["date"], col].to_numpy() * shift
+                fig.add_scatter(x=p["date"], y=y, mode="markers", name=f"{sig.capitalize()} pattern",
+                                text=p["pattern"], marker=dict(size=10, symbol=symbol, color=color),
+                                hovertemplate="%{text}<br>%{x|%d %b %Y}<extra></extra>")
+    _layout(fig, theme, title, "", "Price")
+    fig.update_layout(xaxis_rangeslider_visible=False)
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Valuation and performance measurement (v3.0)
+# --------------------------------------------------------------------------- #
+def dcf_chart(schedule: pd.DataFrame, pv_terminal: float, *, mode: str = "light",
+              title: str = "Where the intrinsic value comes from") -> go.Figure:
+    """Present value of each explicit year's cash flow plus the present value of the terminal value."""
+    theme = _theme(mode)
+    labels = [f"Year {t}" for t in schedule.index] + ["Terminal value"]
+    values = list(schedule["present_value"].astype(float)) + [pv_terminal]
+    colors = [theme["series"][0]] * len(schedule) + [theme["series"][1]]
+    fig = go.Figure(go.Bar(x=labels, y=values, marker=dict(color=colors, line=dict(width=0)),
+                           text=[f"{v:,.2f}" for v in values], textposition="outside",
+                           hovertemplate="%{x}: PV %{y:,.2f}<extra></extra>"))
+    fig.update_layout(barcornerradius=4)
+    return _layout(fig, theme, title, "", "Present value per share", legend=False)
+
+
+def security_market_line(table: pd.DataFrame, *, rf: float, market_return: float, mode: str = "light",
+                         title: str = "Return vs beta (security market line)") -> go.Figure:
+    """Portfolios by beta and average return; the SML from rf through the market. Vertical
+    distance from the line is Jensen's alpha."""
+    theme = _theme(mode)
+    _require(table, "performance table")
+    x_max = float(max(table["beta"].max(), 1.0) * 1.15)
+    fig = go.Figure()
+    fig.add_scatter(x=[0, x_max], y=[rf, rf + (market_return - rf) * x_max], mode="lines", name="SML",
+                    line=dict(width=1.5, dash="dash", color=theme["muted"]),
+                    hovertemplate="SML<br>beta %{x:.2f}<br>return %{y:.2%}<extra></extra>")
+    fig.add_scatter(x=table["beta"], y=table["return"], mode="markers+text", name="Portfolios",
+                    text=[str(i) for i in table.index], textposition="top center",
+                    textfont=dict(color=theme["ink_secondary"]),
+                    marker=dict(size=11, color=theme["series"][0], line=dict(width=2, color="rgba(255,255,255,0.9)")),
+                    customdata=table["jensen_alpha"],
+                    hovertemplate="%{text}<br>beta %{x:.2f}<br>return %{y:.2%}<br>alpha %{customdata:.2%}<extra></extra>")
+    _layout(fig, theme, title, "Beta", "Average annual return", y_pct=True, legend=False)
+    return fig
+
+
+def timing_scatter(fund_excess: pd.Series, market_excess: pd.Series, *, alpha: float, beta: float, gamma: float,
+                   model: str, mode: str = "light") -> go.Figure:
+    """Fund vs market excess returns with the fitted Treynor-Mazuy curve or Henriksson-Merton kink."""
+    theme = _theme(mode)
+    _require(fund_excess, "returns")
+    fig = go.Figure()
+    fig.add_scatter(x=market_excess, y=fund_excess, mode="markers", name="Periods",
+                    marker=dict(size=5, color=theme["muted"], opacity=0.6),
+                    hovertemplate="Market %{x:.2%}<br>Fund %{y:.2%}<extra></extra>")
+    grid = np.linspace(float(market_excess.min()), float(market_excess.max()), 200)
+    extra = grid**2 if model == "treynor_mazuy" else grid * (grid > 0)
+    fig.add_scatter(x=grid, y=alpha + beta * grid + gamma * extra, mode="lines", name="Fitted",
+                    line=dict(width=2.5, color=theme["series"][0]),
+                    hovertemplate="Fitted %{y:.2%}<extra></extra>")
+    label = "Treynor-Mazuy" if model == "treynor_mazuy" else "Henriksson-Merton"
+    _layout(fig, theme, f"Market timing ({label})", "Market excess return", "Fund excess return",
+            x_pct=True, y_pct=True)
     return fig

@@ -33,6 +33,14 @@ If a strategy raises a QuantEdgeError at a scheduled rebalance (e.g. the optimis
 fails on that window), the portfolio keeps its drifted weights and the date and
 reason are recorded in `skipped_rebalances`. If the very first allocation fails,
 there is nothing to hold, so the error is raised.
+
+Cash (v2.1)
+-----------
+A strategy may also return weight on the reserved key CASH. Cash earns the daily
+risk-free rate from `cash_rate` (annual effective) and drifts like any holding.
+Turnover counts risky assets only, so moving a holding into cash costs c x the amount
+sold and the initial purchase costs c x the invested fraction. A strategy that never
+uses cash gives exactly the same results as before.
 """
 
 from __future__ import annotations
@@ -45,13 +53,19 @@ import pandas as pd
 
 from .config import TRADING_DAYS_PER_YEAR
 from .exceptions import DataError, InsufficientDataError, QuantEdgeError
-from .metrics import annualized_covariance, check_returns, performance_summary
-from .optimize import Caps, historical_inputs, max_sharpe, min_variance
+from .estimators import COV_SAMPLE, covariance
+from .indicators import price_to_sma_from_returns
+from .metrics import annualized_mean_return, check_returns, daily_risk_free, performance_summary
+from .optimize import Caps, max_sharpe, min_variance
+from .riskbased import inverse_volatility, max_diversification, risk_parity
 
 Strategy = Callable[[pd.DataFrame], pd.Series]
 
 _CALENDAR_FREQUENCIES = {"W": "W", "M": "M", "Q": "Q"}
 _WEIGHT_TOLERANCE = 1e-6
+
+#: Reserved weight key for cash in strategy output (earns BacktestConfig.cash_rate).
+CASH = "CASH"
 
 
 # --------------------------------------------------------------------------- #
@@ -63,11 +77,13 @@ class BacktestConfig:
     rebalance: "W" / "M" / "Q" (last trading day of each week / month / quarter),
                an int H (every H trading days), or None (buy and hold, never rebalance).
     cost_bps:  proportional cost per unit of value traded, in basis points.
+    cash_rate: annual effective rate earned by weight held in CASH.
     """
 
     lookback: int = 252
     rebalance: str | int | None = "M"
     cost_bps: float = 10.0
+    cash_rate: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.lookback, int) or self.lookback < 2:
@@ -80,6 +96,7 @@ class BacktestConfig:
             raise ValueError("rebalance must be 'W', 'M', 'Q', a positive integer, or None.")
         if not np.isfinite(self.cost_bps) or not 0 <= self.cost_bps < 10_000:
             raise ValueError("cost_bps must be between 0 and 10,000.")
+        daily_risk_free(self.cash_rate)  # validates: finite and above -100 %
 
 
 @dataclass(frozen=True)
@@ -114,19 +131,71 @@ def fixed_weights(weights: Mapping[str, float] | pd.Series) -> Strategy:
     return strategy
 
 
-def min_variance_strategy(max_weight: Caps = 1.0) -> Strategy:
+def min_variance_strategy(max_weight: Caps = 1.0, cov_method: str = COV_SAMPLE) -> Strategy:
     def strategy(window: pd.DataFrame) -> pd.Series:
-        return min_variance(annualized_covariance(window), max_weight=max_weight).weights
+        return min_variance(covariance(window, cov_method), max_weight=max_weight).weights
 
     return strategy
 
 
-def max_sharpe_strategy(rf_annual: float = 0.0, max_weight: Caps = 1.0) -> Strategy:
+def max_sharpe_strategy(rf_annual: float = 0.0, max_weight: Caps = 1.0,
+                        cov_method: str = COV_SAMPLE) -> Strategy:
     def strategy(window: pd.DataFrame) -> pd.Series:
-        mu, cov = historical_inputs(window)
+        mu, cov = annualized_mean_return(window), covariance(window, cov_method)
         return max_sharpe(mu, cov, rf_annual=rf_annual, max_weight=max_weight).weights
 
     return strategy
+
+
+def inverse_volatility_strategy(max_weight: Caps = 1.0, cov_method: str = COV_SAMPLE) -> Strategy:
+    def strategy(window: pd.DataFrame) -> pd.Series:
+        return inverse_volatility(covariance(window, cov_method), max_weight=max_weight).weights
+
+    return strategy
+
+
+def risk_parity_strategy(max_weight: Caps = 1.0, cov_method: str = COV_SAMPLE) -> Strategy:
+    def strategy(window: pd.DataFrame) -> pd.Series:
+        return risk_parity(covariance(window, cov_method), max_weight=max_weight).weights
+
+    return strategy
+
+
+def max_diversification_strategy(max_weight: Caps = 1.0, cov_method: str = COV_SAMPLE) -> Strategy:
+    def strategy(window: pd.DataFrame) -> pd.Series:
+        return max_diversification(covariance(window, cov_method), max_weight=max_weight).weights
+
+    return strategy
+
+
+def sma_trend_filter(base: Strategy, window: int = 200) -> Strategy:
+    """Hold the base weight of each asset while its price is above its SMA; the rest goes to CASH.
+
+    Weight is not redistributed, so the base strategy's caps are preserved and a broad
+    downtrend means mostly cash. Needs a lookback of at least window - 1 returns.
+    """
+
+    def strategy(win: pd.DataFrame) -> pd.Series:
+        ratio = price_to_sma_from_returns(win, window)
+        weights = base(win).reindex(win.columns).astype(float)
+        cash = float(weights[ratio <= 1.0].sum())
+        weights[ratio <= 1.0] = 0.0
+        return pd.concat([weights, pd.Series({CASH: cash})])
+
+    return strategy
+
+
+#: Registry used by the dashboard and scripts: name -> factory(rf, cap, cov_method, sma_window).
+STRATEGY_FACTORIES: dict[str, Callable[[float, Caps, str, int], Strategy]] = {
+    "Equal weight": lambda rf, cap, cov, n: equal_weight(),
+    "Equal weight + SMA filter": lambda rf, cap, cov, n: sma_trend_filter(equal_weight(), n),
+    "Min variance": lambda rf, cap, cov, n: min_variance_strategy(cap, cov),
+    "Max Sharpe": lambda rf, cap, cov, n: max_sharpe_strategy(rf, cap, cov),
+    "Inverse volatility": lambda rf, cap, cov, n: inverse_volatility_strategy(cap, cov),
+    "Risk parity": lambda rf, cap, cov, n: risk_parity_strategy(cap, cov),
+    "Risk parity + SMA filter": lambda rf, cap, cov, n: sma_trend_filter(risk_parity_strategy(cap, cov), n),
+    "Max diversification": lambda rf, cap, cov, n: max_diversification_strategy(cap, cov),
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +227,8 @@ def run_backtest(
     if not isinstance(returns, pd.DataFrame) or returns.shape[1] == 0:
         raise TypeError("returns must be a DataFrame with one column per asset.")
     check_returns(returns, min_obs=2)
+    if any(str(c).strip().upper() == CASH for c in returns.columns):
+        raise DataError(f"'{CASH}' is reserved for the cash position in backtests; rename that column.")
     if returns.index.has_duplicates or not returns.index.is_monotonic_increasing:
         raise DataError("Return dates must be unique and sorted in increasing order.")
 
@@ -170,22 +241,30 @@ def run_backtest(
         )
 
     assets = list(returns.columns)
-    values = returns.to_numpy(dtype=float)
+    n_assets = len(assets)
+    # Last column is cash, earning the daily risk-free rate.
+    values = np.column_stack([returns.to_numpy(dtype=float),
+                              np.full(n_days, daily_risk_free(config.cash_rate))])
+    uses_cash = False
     dates = returns.index
     start = lookback - 1                                   # first row with a full window
     schedule = set(rebalance_positions(dates, config.rebalance, start))
     c = config.cost_bps / 10_000.0
 
     def decide(p: int) -> np.ndarray:
+        nonlocal uses_cash
         # The ONLY data the strategy ever receives: a copy of rows p-L+1 ... p.
         window = returns.iloc[p - lookback + 1 : p + 1].copy()
-        return _validated_weights(strategy(window), assets, dates[p])
+        target = strategy(window)
+        if isinstance(target, pd.Series) and CASH in target.index:
+            uses_cash = True
+        return _validated_weights(target, assets, dates[p])
 
     # Initial allocation from cash at the close of `start`.
     weights = decide(start)
-    pending_cost = c * float(np.abs(weights).sum())        # tau = 1 when buying from cash
+    pending_cost = c * float(weights[:n_assets].sum())     # tau = invested fraction (1 if no cash)
     trade_dates, trade_weights = [dates[start]], [weights.copy()]
-    turnovers, costs = [1.0], [pending_cost]
+    turnovers, costs = [float(weights[:n_assets].sum())], [pending_cost]
     skipped: list[tuple[pd.Timestamp, str]] = []
 
     gross = np.empty(n_days - start - 1)
@@ -203,7 +282,7 @@ def run_backtest(
             except QuantEdgeError as exc:
                 skipped.append((dates[p], str(exc)))
             else:
-                tau = float(np.abs(target - weights).sum())
+                tau = float(np.abs(target[:n_assets] - weights[:n_assets]).sum())  # risky assets only
                 factor *= 1.0 - c * tau
                 weights = target
                 trade_dates.append(dates[p])
@@ -222,7 +301,7 @@ def run_backtest(
         returns=net_returns,
         gross_returns=pd.Series(gross, index=perf_index, name=name),
         wealth=wealth.rename(name),
-        weights=pd.DataFrame(trade_weights, index=pd.DatetimeIndex(trade_dates), columns=assets),
+        weights=_weights_frame(trade_weights, trade_dates, assets, uses_cash),
         turnover=pd.Series(turnovers, index=pd.DatetimeIndex(trade_dates), name="turnover"),
         costs=pd.Series(costs, index=pd.DatetimeIndex(trade_dates), name="cost"),
         config=config,
@@ -230,13 +309,21 @@ def run_backtest(
     )
 
 
+def _weights_frame(rows, dates, assets, uses_cash: bool) -> pd.DataFrame:
+    frame = pd.DataFrame(rows, index=pd.DatetimeIndex(dates), columns=[*assets, CASH])
+    return frame if uses_cash else frame[assets]
+
+
 def _validated_weights(target: pd.Series, assets: list[str], when: pd.Timestamp) -> np.ndarray:
-    """Strategies must return finite, long-only weights summing to 1 for exactly these assets."""
+    """Strategies must return finite, long-only weights summing to 1 for exactly these assets
+    (optionally plus CASH). Returns a vector of the asset weights followed by the cash weight."""
     if not isinstance(target, pd.Series):
         raise TypeError(f"Strategy must return a pandas Series of weights (on {when.date()}).")
-    if set(target.index) != set(assets):
+    keys = set(target.index)
+    if keys != set(assets) and keys != set(assets) | {CASH}:
         raise ValueError(f"Strategy weights on {when.date()} do not match the assets {assets}.")
-    w = target.reindex(assets).to_numpy(dtype=float)
+    cash = float(target[CASH]) if CASH in target.index else 0.0  # absent CASH means no cash held
+    w = np.append(target.reindex(assets).to_numpy(dtype=float), cash)
     if not np.isfinite(w).all() or (w < -_WEIGHT_TOLERANCE).any() or abs(w.sum() - 1) > _WEIGHT_TOLERANCE:
         raise ValueError(
             f"Strategy weights on {when.date()} must be finite, non-negative and sum to 1 "

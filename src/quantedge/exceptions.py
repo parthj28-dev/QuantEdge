@@ -22,3 +22,7 @@ class InsufficientDataError(DataError):
 
 class OptimizationError(QuantEdgeError):
     """An optimisation problem is infeasible or the solver failed."""
+
+
+class EstimationError(QuantEdgeError):
+    """Model inputs are invalid or contradictory (e.g. Black-Litterman views, risk aversion)."""

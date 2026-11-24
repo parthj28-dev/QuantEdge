@@ -358,3 +358,83 @@ def _reject(df: pd.DataFrame, mask: np.ndarray, what: str) -> None:
             f"{df.columns[col]} has a {what} ({df.iat[row, col]}) on {df.index[row].date()}. "
             "The data source is unreliable for this ticker; remove it or use another source."
         )
+
+
+# --------------------------------------------------------------------------- #
+# OHLCV for one ticker (v3.0: candlestick patterns and volume)
+# --------------------------------------------------------------------------- #
+OHLCV_FIELDS = ("Open", "High", "Low", "Close", "Volume")
+
+
+@dataclass(frozen=True)
+class OHLCVData:
+    """Daily Open/High/Low/Close/Volume for one ticker. Prices are NOT dividend-adjusted
+    (candlesticks describe the traded session); rows with any missing field are dropped
+    and counted, never filled."""
+
+    frame: pd.DataFrame
+    ticker: str
+    dropped_rows: int
+
+
+def extract_ohlcv(raw: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Pull one ticker's OHLCV from a yfinance-shaped download (either column layout)."""
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        raise DataError(f"No OHLC data returned for {ticker}.")
+    cols = raw.columns
+    out = {}
+    for field in OHLCV_FIELDS:
+        if isinstance(cols, pd.MultiIndex):
+            if (field, ticker) in cols:
+                out[field] = raw[(field, ticker)]
+            elif (ticker, field) in cols:
+                out[field] = raw[(ticker, field)]
+        elif field in cols:
+            out[field] = raw[field]
+    missing = [f for f in OHLCV_FIELDS[:4] if f not in out]
+    if missing:
+        raise DataError(f"OHLC column(s) {', '.join(missing)} not found for {ticker}.")
+    return pd.DataFrame(out)
+
+
+def _clean_ohlcv(frame: pd.DataFrame, ticker: str, min_observations: int) -> OHLCVData:
+    frame = frame.sort_index()
+    if frame.index.has_duplicates:
+        raise DataError("OHLC data has duplicate dates.")
+    before = len(frame)
+    frame = frame.dropna(subset=[c for c in OHLCV_FIELDS[:4]]).astype(float)
+    dropped = before - len(frame)
+    if "Volume" in frame and frame["Volume"].isna().any():
+        frame = frame.drop(columns="Volume")      # volume is optional; never filled
+    prices = frame[list(OHLCV_FIELDS[:4])]
+    if not np.isfinite(prices.to_numpy()).all() or (prices.to_numpy() <= 0).any():
+        raise DataError(f"{ticker}: OHLC prices must be positive and finite.")
+    if len(frame) < min_observations:
+        raise InsufficientDataError(f"{ticker}: only {len(frame)} complete daily candles; "
+                                    f"at least {min_observations} are needed.")
+    return OHLCVData(frame, ticker, dropped)
+
+
+def fetch_ohlcv(ticker: str, start, end, *, downloader: Downloader | None = None,
+                min_observations: int = 30) -> OHLCVData:
+    symbol = parse_tickers(ticker)[0]
+    download = downloader or yfinance_downloader
+    try:
+        raw = download([symbol], pd.Timestamp(start).strftime("%Y-%m-%d"), pd.Timestamp(end).strftime("%Y-%m-%d"))
+    except Exception as exc:
+        raise DataError(f"OHLC download failed: {exc}") from exc
+    return _clean_ohlcv(extract_ohlcv(raw, symbol), symbol, min_observations)
+
+
+def load_ohlcv_csv(source, *, ticker: str = "UPLOAD", min_observations: int = 30) -> OHLCVData:
+    """CSV with a Date column first (YYYY-MM-DD) and Open, High, Low, Close (and optional Volume)."""
+    try:
+        frame = pd.read_csv(source, index_col=0)
+        frame.index = pd.to_datetime(frame.index, format="ISO8601")
+    except Exception as exc:
+        raise DataError(f"Could not read OHLC CSV (dates must be YYYY-MM-DD): {exc}") from exc
+    frame.columns = [str(c).strip().title() for c in frame.columns]
+    missing = [f for f in OHLCV_FIELDS[:4] if f not in frame.columns]
+    if missing:
+        raise DataError(f"OHLC CSV is missing column(s): {', '.join(missing)}.")
+    return _clean_ohlcv(frame[[c for c in OHLCV_FIELDS if c in frame.columns]], ticker, min_observations)
