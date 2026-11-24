@@ -42,21 +42,42 @@ def error_texts(at: AppTest) -> list[str]:
     return [e.value for e in at.error]
 
 
-def test_app_starts_with_instructions():
+TABS = ["Overview", "Risk", "CAPM", "Estimation", "Optimisation", "Backtest", "Trend",
+        "Technical", "Valuation", "Performance", "Methodology"]
+
+
+def synthetic_ohlc_csv(n_days: int = 120, seed: int = 4) -> bytes:
+    rng = np.random.default_rng(seed)
+    close = 100 * np.cumprod(1 + rng.normal(0, 0.012, n_days))
+    open_ = close * (1 + rng.normal(0, 0.005, n_days))
+    high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.004, n_days)))
+    low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.004, n_days)))
+    frame = pd.DataFrame({"Open": open_, "High": high, "Low": low, "Close": close,
+                          "Volume": rng.integers(1_000, 5_000, n_days)},
+                         index=pd.bdate_range("2023-01-02", periods=n_days))
+    return frame.to_csv(index_label="Date").encode()
+
+
+def test_app_starts_with_instructions_and_valuation_works_without_data():
     at = AppTest.from_file(APP, default_timeout=60)
     at.run()
     assert not at.exception
     assert any("Load data" in i.value for i in at.info)
+    assert [t.label for t in at.tabs] == TABS
+    # Valuation defaults reproduce lecture 22 problem 1: about 168, sell
+    values = {m.label: m.value for m in at.metric}
+    assert values["Intrinsic value"] == "167.84" and values["Signal"] == "Sell"
 
 
 def test_full_pipeline_renders_without_errors():
     at = load_csv_app()
     assert not at.exception, at.exception
     assert error_texts(at) == []
-    assert [t.label for t in at.tabs] == ["Overview", "Risk", "CAPM", "Optimisation", "Backtest", "Methodology"]
-    # Overview scatter, heatmap, allocation bar, pie, frontier
-    assert len(at.get("plotly_chart")) == 5
-    assert len(at.dataframe) >= 4  # stats, correlation, CAPM, portfolios (+ expanders)
+    assert [t.label for t in at.tabs] == TABS
+    # scatter, heatmap, expected returns, allocation bar, pie, risk contributions, frontier, trend,
+    # technical panels, DCF, security market line, timing scatter
+    assert len(at.get("plotly_chart")) == 12
+    assert len(at.dataframe) >= 10
 
 
 def test_backtest_runs_from_the_form():
@@ -65,9 +86,58 @@ def test_backtest_runs_from_the_form():
     lookback.set_value(60)
     next(b for b in at.button if b.label == "Run backtest").click().run()
     assert not at.exception, at.exception
-    assert error_texts(at) == []
+    # The default 200-day SMA filter cannot start with a 60-day lookback: reported, others still run
+    errors = error_texts(at)
+    assert len(errors) == 1 and "SMA filter" in errors[0] and "at least 199" in errors[0]
     # equity, drawdown and weights-over-time charts are added
-    assert len(at.get("plotly_chart")) == 8
+    assert len(at.get("plotly_chart")) == 15
+    assert next(t for t in at.toggle if t.label.startswith("Include backtest")).value is True
+
+
+def test_every_valuation_model_renders():
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.run()
+    for model in at.radio(key="fa_model").options:
+        at.radio(key="fa_model").set_value(model).run()
+        assert not at.exception, (model, at.exception)
+        assert error_texts(at) == [], model
+    at.radio(key="fa_model").set_value("Free cash flow (DCF)").run()
+    at.radio(key="fa_basis").set_value("FCFF (discount at WACC)").run()
+    assert not at.exception and error_texts(at) == []
+
+
+def test_performance_summary_mode_reproduces_lecture_table():
+    at = AppTest.from_file(APP, default_timeout=60)
+    at.run()
+    at.radio(key="ppm_mode").set_value("From summary statistics (lecture problems)").run()
+    assert not at.exception and error_texts(at) == []
+    table = at.dataframe[-1].value
+    assert table.loc["P", "unsystematic_variance"] == pytest.approx(0.0009)
+    assert table.loc["S", "sharpe_rank"] == 1
+
+
+def test_performance_from_data_and_timing_models():
+    at = load_csv_app()
+    for freq in ("Daily", "Weekly", "Monthly"):
+        at.selectbox(key="ppm_freq").set_value(freq).run()
+        at.selectbox(key="ppm_model").set_value("Henriksson-Merton (two betas)").run()
+        assert not at.exception and error_texts(at) == [], freq
+
+
+def test_candlesticks_from_uploaded_ohlc():
+    at = load_csv_app()
+    at.file_uploader(key="ta_ohlc_csv").upload("ohlc.csv", synthetic_ohlc_csv(), "text/csv").run()
+    assert not at.exception, at.exception
+    assert error_texts(at) == []
+    assert len(at.get("plotly_chart")) == 13           # candlestick chart added
+
+
+def test_black_litterman_and_shrinkage_choices_render():
+    at = load_csv_app()
+    for choice in ("Black-Litterman", "CAPM", "Historical mean"):
+        next(r for r in at.sidebar.radio if r.label.startswith("Expected returns")).set_value(choice).run()
+        next(r for r in at.sidebar.radio if r.label.startswith("Covariance")).set_value("Ledoit-Wolf shrinkage").run()
+        assert not at.exception and error_texts(at) == [], choice
 
 
 def test_infeasible_cap_is_reported_but_page_still_renders():

@@ -197,3 +197,64 @@ def test_package_never_imports_streamlit():
     code = ("import sys, quantedge.charts, quantedge.backtest, quantedge.capm, quantedge.data; "
             "sys.exit(1 if 'streamlit' in sys.modules else 0)")
     assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# v2 - v3 charts
+# --------------------------------------------------------------------------- #
+def test_layering_covers_all_modules():
+    code = ("import sys, quantedge.charts, quantedge.estimators, quantedge.riskbased, quantedge.indicators, "
+            "quantedge.valuation, quantedge.technical, quantedge.performance; "
+            "sys.exit(1 if 'streamlit' in sys.modules else 0)")
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0
+
+
+def test_expected_returns_and_risk_contribution_charts(returns):
+    from quantedge.riskbased import risk_contributions, risk_parity
+    from quantedge.metrics import annualized_covariance
+    table = pd.DataFrame({"Hist": [0.1, 0.2, 0.05], "BL": [0.08, 0.12, 0.07]}, index=["A", "B", "C"])
+    fig = charts.expected_returns_chart(table)
+    assert [t.name for t in fig.data] == ["Hist", "BL"]
+    np.testing.assert_allclose(fig.data[1].y, [0.08, 0.12, 0.07])
+    cov = annualized_covariance(returns)
+    rc = risk_contributions(risk_parity(cov).weights, cov)
+    fig = charts.risk_contribution_chart(rc)
+    np.testing.assert_allclose(fig.data[1].y, rc["risk_share"])
+
+
+def test_trend_chart_marks_crosses(synthetic_prices):
+    from quantedge.indicators import crosses, sma
+    px = synthetic_prices["AAA"]
+    ev = crosses(px, 5, 20)
+    fig = charts.trend_chart(px, {"SMA 5": sma(px, 5), "SMA 20": sma(px, 20)}, events=ev)
+    marked = sum(len(t.x) for t in fig.data if t.mode == "markers")
+    assert marked == len(ev) > 0
+
+
+def test_technical_chart_has_three_panels(synthetic_prices):
+    from quantedge import technical as ta
+    px = synthetic_prices["BBB"]
+    fig = charts.technical_chart(px, bands=ta.bollinger_bands(px), macd_frame=ta.macd(px), rsi_line=ta.rsi(px),
+                                 ema_lines={"EMA 20": ta.ema(px, 20)}, events=ta.technical_signals(px))
+    names = [t.name for t in fig.data]
+    assert {"Upper band", "Lower band", "MACD", "Signal", "RSI", "EMA 20"} <= set(names)
+    rsi_trace = next(t for t in fig.data if t.name == "RSI")
+    assert rsi_trace.yaxis == "y3"
+
+
+def test_candlestick_and_dcf_and_sml_and_timing():
+    from quantedge.valuation import multistage_ddm
+    idx = pd.bdate_range("2024-01-01", periods=3)
+    ohlc = pd.DataFrame({"Open": [10, 11, 12], "High": [11, 12, 13], "Low": [9, 10, 11], "Close": [11, 12, 11]}, idx)
+    pats = pd.DataFrame({"date": [idx[2]], "pattern": ["Doji"], "signal": ["bearish"], "needs_confirmation": [True]})
+    fig = charts.candlestick_chart(ohlc, patterns=pats)
+    assert fig.data[0].type == "candlestick" and list(fig.data[1].text) == ["Doji"]
+    res = multistage_ddm(2, [0.08] * 3, 0.04, 0.12)
+    fig = charts.dcf_chart(res.schedule, res.pv_terminal)
+    assert sum(fig.data[0].y) == pytest.approx(res.value)
+    table = pd.DataFrame({"beta": [0.8, 1.2], "return": [0.1, 0.15], "jensen_alpha": [0.01, -0.01]}, index=["X", "Y"])
+    fig = charts.security_market_line(table, rf=0.05, market_return=0.12)
+    assert fig.data[0].y[0] == pytest.approx(0.05)
+    m = pd.Series(np.linspace(-0.02, 0.02, 50))
+    fig = charts.timing_scatter(0.5 * m, m, alpha=0.0, beta=0.5, gamma=0.0, model="treynor_mazuy")
+    np.testing.assert_allclose(fig.data[1].y, 0.5 * np.asarray(fig.data[1].x))

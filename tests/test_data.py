@@ -234,3 +234,51 @@ def test_csv_ambiguous_day_month_dates_are_refused(tmp_path):
     path.write_text("Date,AAA\n03-04-2024,100\n04-04-2024,101\n")
     with pytest.raises(DataError, match="YYYY-MM-DD"):
         load_prices_csv(path, min_observations=1)
+
+
+# --------------------------------------------------------------------------- #
+# OHLCV (v3.0)
+# --------------------------------------------------------------------------- #
+def _ohlcv_raw(field_first: bool = True, ticker: str = "TCS.NS") -> pd.DataFrame:
+    idx = pd.bdate_range("2024-01-01", periods=40)
+    close = pd.Series(np.linspace(100, 120, 40), idx)
+    fields = {"Open": close - 0.5, "High": close + 1, "Low": close - 1, "Close": close,
+              "Adj Close": close * 0.98, "Volume": close * 0 + 1000}
+    cols = [(f, ticker) if field_first else (ticker, f) for f in fields]
+    return pd.DataFrame(np.column_stack(list(fields.values())), index=idx, columns=pd.MultiIndex.from_tuples(cols))
+
+
+@pytest.mark.parametrize("field_first", [True, False])
+def test_fetch_ohlcv_both_layouts(fake_downloader, field_first):
+    from quantedge.data import fetch_ohlcv
+    out = fetch_ohlcv("tcs.ns", "2024-01-01", "2024-03-01", downloader=fake_downloader(_ohlcv_raw(field_first)))
+    assert list(out.frame.columns) == ["Open", "High", "Low", "Close", "Volume"]
+    assert out.frame["Close"].iloc[-1] == pytest.approx(120)      # unadjusted close, not Adj Close
+    assert out.ticker == "TCS.NS" and out.dropped_rows == 0
+
+
+def test_ohlcv_gaps_are_dropped_and_counted(fake_downloader):
+    from quantedge.data import fetch_ohlcv
+    raw = _ohlcv_raw()
+    raw.iloc[5, 0] = np.nan
+    out = fetch_ohlcv("TCS.NS", "2024-01-01", "2024-03-01", downloader=fake_downloader(raw))
+    assert out.dropped_rows == 1 and len(out.frame) == 39
+
+
+def test_ohlcv_csv(tmp_path):
+    from quantedge.data import load_ohlcv_csv
+    raw = _ohlcv_raw().droplevel(1, axis=1).drop(columns=["Adj Close", "Volume"])
+    raw.columns = [c.lower() for c in raw.columns]                # case-insensitive headers
+    path = tmp_path / "o.csv"
+    raw.to_csv(path, index_label="Date")
+    out = load_ohlcv_csv(path, ticker="X")
+    assert "Volume" not in out.frame and len(out.frame) == 40
+    raw.drop(columns="high").to_csv(path, index_label="Date")
+    with pytest.raises(DataError, match="High"):
+        load_ohlcv_csv(path)
+
+
+def test_ohlcv_too_short(fake_downloader):
+    from quantedge.data import fetch_ohlcv
+    with pytest.raises(InsufficientDataError):
+        fetch_ohlcv("TCS.NS", "2024-01-01", "2024-03-01", downloader=fake_downloader(_ohlcv_raw().iloc[:10]))
