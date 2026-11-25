@@ -315,7 +315,7 @@ recovers both betas exactly on noiseless data, collinear regressors raise `Estim
 |---|---|---|
 | v1.0.0 | Data, metrics, CAPM, optimisation, frontier, backtest, charts, dashboard | 211 |
 | v2.0 / v2.1 | Ledoit-Wolf, Black-Litterman, risk-based portfolios, SMA indicators, cash, trend filter | — |
-| **v3.0.0** | v2.x features rebuilt from this specification (the v2.x code was never published), plus valuation, technical analysis, performance measurement, OHLCV data, 11-tab dashboard | 369 |
+| **v3.0.0** | v2.x features rebuilt from this specification (the v2.x commits are no longer on `main`), plus valuation, technical analysis, performance measurement, OHLCV data, 11-tab dashboard | 369 |
 
 ---
 
