@@ -109,9 +109,11 @@ def chart_mode() -> str:
         return "light"
 
 
-def styled(table: pd.DataFrame, pct_cols=(), num_cols=(), int_cols=(), money_cols=()):
-    """Format for display only; NaN is shown as 'undefined', never as 0."""
-    fmt = {c: PCT for c in pct_cols if c in table}
+def styled(table: pd.DataFrame, pct_cols=(), num_cols=(), int_cols=(), money_cols=(), extra=None):
+    """Format for display only; NaN is shown as 'undefined', never as 0. One format call, so
+    every column keeps its format (a second Styler.format call would reset the others)."""
+    fmt = {c: f for c, f in (extra or {}).items() if c in table}
+    fmt.update({c: PCT for c in pct_cols if c in table})
     fmt.update({c: "{:.2f}" for c in num_cols if c in table})
     fmt.update({c: "{:,.0f}" for c in int_cols if c in table})
     fmt.update({c: "{:,.2f}" for c in money_cols if c in table})
@@ -809,8 +811,8 @@ with tab_ppm:
             table = ppm.measures_from_summary(frame, market_return=m_ret, market_std=m_sd, risk_free=rf_s)
             st.dataframe(styled(table, pct_cols=["return", "std", "excess_return", "treynor", "jensen_alpha",
                                                  "m_squared", "m_squared_vs_market"],
-                                num_cols=["beta", "sharpe", "r_squared"], int_cols=["sharpe_rank", "treynor_rank"])
-                         .format({"systematic_variance": "{:.4f}", "unsystematic_variance": "{:.4f}"}))
+                                num_cols=["beta", "sharpe", "r_squared"], int_cols=["sharpe_rank", "treynor_rank"],
+                                extra={"systematic_variance": "{:.4f}", "unsystematic_variance": "{:.4f}"}))
             st.plotly_chart(charts.security_market_line(table, rf=rf_s, market_return=m_ret, mode=mode),
                             width="stretch")
             st.caption("Sharpe and Treynor agree for fully diversified portfolios. When they rank differently, "
@@ -839,8 +841,8 @@ with tab_ppm:
                                                  "jensen_alpha", "tracking_error", "m_squared",
                                                  "m_squared_vs_benchmark"],
                                 num_cols=["beta", "sharpe", "alpha_t_stat", "information_ratio", "r_squared"],
-                                int_cols=["observations", "sharpe_rank", "treynor_rank"])
-                         .format({"systematic_variance": "{:.4f}", "unsystematic_variance": "{:.4f}"}))
+                                int_cols=["observations", "sharpe_rank", "treynor_rank"],
+                                extra={"systematic_variance": "{:.4f}", "unsystematic_variance": "{:.4f}"}))
             st.caption(f"{freq_label} returns, annualised with {periods} periods per year. Jensen's alpha is "
                        "significant at about 5 % when |t| > 2. M² is the return at the benchmark's volatility.")
             sml = table.rename(columns={"annual_return": "return"})
@@ -858,8 +860,8 @@ with tab_ppm:
             timing = ppm.market_timing(port_p, bench_p, rf_annual=rf, model=model_key, periods_per_year=periods,
                                        min_observations=12)
             st.dataframe(styled(timing.table, num_cols=["alpha_t", "beta", "beta_t", "gamma_t", "r_squared",
-                                                        "up_market_beta"], int_cols=["observations"])
-                         .format({"alpha": "{:.5f}", "gamma": "{:.4f}"}, na_rep="undefined"))
+                                                        "up_market_beta"], int_cols=["observations"],
+                                extra={"alpha": "{:.5f}", "gamma": "{:.4f}"}))
             st.caption(f"γ > 0 with t > 2 suggests timing ability. {timing.up_periods} up-market and "
                        f"{timing.down_periods} down-market periods. Alpha is per period.")
             who = c2.selectbox("Plot", list(timing.table.index), key="ppm_who")
