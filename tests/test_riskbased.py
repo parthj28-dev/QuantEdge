@@ -99,8 +99,8 @@ def test_inverse_vol_caps_are_water_filled():
 
 def test_capped_risk_parity_respects_caps_and_says_so():
     res = risk_parity(COV, max_weight=0.3)
-    assert res.weights.max() <= 0.3 + 1e-8
-    assert res.weights.sum() == pytest.approx(1.0)
+    assert res.weights.max() <= 0.3                      # exactly within the cap, no rounding excess
+    assert res.weights.sum() == pytest.approx(1.0, abs=1e-12)
     assert res.notes and "caps" in res.notes[0]
 
 
