@@ -174,9 +174,15 @@ def _capped_risk_parity(sigma: np.ndarray, caps: np.ndarray, start: np.ndarray) 
                    constraints=({"type": "eq", "fun": lambda w: w.sum() - 1.0},),
                    options={"ftol": 1e-14, "maxiter": 1000})
     w = np.clip(np.asarray(res.x, dtype=float), 0.0, caps)
-    if abs(w.sum() - 1.0) > 1e-6:
+    deficit = 1.0 - w.sum()
+    if abs(deficit) > 1e-6:
         raise OptimizationError(f"Capped risk parity failed: {res.message}")
-    return w / w.sum(), int(res.nit)
+    # Give the solver's rounding dust to assets below their cap only; rescaling every weight
+    # would push capped weights slightly over their cap.
+    room = caps - w if deficit > 0 else w
+    if room.sum() > 0:
+        w = w + deficit * room / room.sum()
+    return np.clip(w, 0.0, caps), int(res.nit)
 
 
 # --------------------------------------------------------------------------- #
