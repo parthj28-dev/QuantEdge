@@ -139,3 +139,28 @@ def test_expected_return_reported_when_mu_given():
 def test_diversification_ratio_of_single_asset_is_one():
     w = pd.Series([1.0, 0, 0, 0], index=NAMES)
     assert diversification_ratio(w, COV) == pytest.approx(1.0)
+
+
+def test_capped_simplex_projection_is_exactly_feasible():
+    from quantedge.riskbased import _project_capped_simplex
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        n = rng.integers(2, 12)
+        caps = np.full(n, max(1.0 / n + 0.01, rng.uniform(0.1, 1.0)))
+        w = _project_capped_simplex(rng.normal(0.1, 0.3, n), caps)
+        assert (w >= 0).all() and (w <= caps).all()
+        assert w.sum() == pytest.approx(1.0, abs=1e-12)
+
+
+def test_capped_risk_parity_when_solver_stops_early(monkeypatch):
+    # Simulate the CI failure: SLSQP returns an infeasible point with an error message.
+    import quantedge.riskbased as rb
+    from scipy.optimize import OptimizeResult
+
+    def broken(fun, x0, **kwargs):
+        return OptimizeResult(x=np.asarray(x0) * 1.01, nit=3, success=False,
+                              message="Positive directional derivative for linesearch")
+
+    monkeypatch.setattr(rb, "minimize", broken)
+    res = risk_parity(COV, max_weight=0.3)
+    assert res.weights.max() <= 0.3 and res.weights.sum() == pytest.approx(1.0, abs=1e-12)
