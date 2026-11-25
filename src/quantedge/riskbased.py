@@ -162,27 +162,55 @@ def risk_parity(cov: pd.DataFrame, *, max_weight: Caps = 1.0, mu: pd.Series | No
     return _result(w, cov.loc[p.assets, p.assets], mu, rf_annual, RISK_PARITY, nit, notes)
 
 
+def _project_capped_simplex(x: np.ndarray, caps: np.ndarray) -> np.ndarray:
+    """Closest point to x (Euclidean) with sum(w) = 1 and 0 <= w <= caps.
+
+    w = clip(x - t, 0, caps) is monotone in t, so t is found by bisection; the last rounding
+    dust goes to assets strictly inside their bounds, so no weight ever exceeds its cap.
+    """
+    lo, hi = float(x.min() - caps.max() - 1.0), float(x.max() + 1.0)
+    for _ in range(200):
+        t = 0.5 * (lo + hi)
+        if np.clip(x - t, 0.0, caps).sum() > 1.0:
+            lo = t
+        else:
+            hi = t
+    w = np.clip(x - 0.5 * (lo + hi), 0.0, caps)
+    deficit = 1.0 - w.sum()
+    room = (caps - w) if deficit > 0 else w
+    if room.sum() > 0:
+        w = np.clip(w + deficit * room / room.sum(), 0.0, caps)
+    return w
+
+
 def _capped_risk_parity(sigma: np.ndarray, caps: np.ndarray, start: np.ndarray) -> tuple[np.ndarray, int]:
+    """Minimise the squared gaps between risk shares and 1/n under the caps.
+
+    SLSQP can stop early on some platforms (e.g. 'positive directional derivative'), so its
+    answer is never trusted as-is: each candidate is projected exactly onto the feasible set
+    and the best projected candidate is kept.
+    """
     n = len(caps)
 
     def objective(w: np.ndarray) -> float:
         var = float(w @ sigma @ w)
-        return float((((w * (sigma @ w)) / var - 1.0 / n) ** 2).sum()) * 1e4
+        return float((((w * (sigma @ w)) / var - 1.0 / n) ** 2).sum())
 
-    x0 = _capped_proportional(start, caps)
-    res = minimize(objective, x0, method="SLSQP", bounds=list(zip(np.zeros(n), caps)),
-                   constraints=({"type": "eq", "fun": lambda w: w.sum() - 1.0},),
-                   options={"ftol": 1e-14, "maxiter": 1000})
-    w = np.clip(np.asarray(res.x, dtype=float), 0.0, caps)
-    deficit = 1.0 - w.sum()
-    if abs(deficit) > 1e-6:
-        raise OptimizationError(f"Capped risk parity failed: {res.message}")
-    # Give the solver's rounding dust to assets below their cap only; rescaling every weight
-    # would push capped weights slightly over their cap.
-    room = caps - w if deficit > 0 else w
-    if room.sum() > 0:
-        w = w + deficit * room / room.sum()
-    return np.clip(w, 0.0, caps), int(res.nit)
+    starts = [_capped_proportional(start, caps), _capped_proportional(np.ones(n), caps)]
+    best, best_score, iterations = None, np.inf, 0
+    for x0 in starts:
+        res = minimize(objective, x0, method="SLSQP", bounds=list(zip(np.zeros(n), caps)),
+                       constraints=({"type": "eq", "fun": lambda w: w.sum() - 1.0},),
+                       options={"ftol": 1e-15, "maxiter": 1000})
+        iterations += int(res.nit)
+        for cand in (np.asarray(res.x, dtype=float), x0):
+            w = _project_capped_simplex(cand, caps)
+            score = objective(w)
+            if np.isfinite(score) and score < best_score:
+                best, best_score = w, score
+    if best is None:
+        raise OptimizationError("Capped risk parity failed to find a feasible portfolio.")
+    return best, iterations
 
 
 # --------------------------------------------------------------------------- #
