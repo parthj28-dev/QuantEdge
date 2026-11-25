@@ -25,9 +25,9 @@ All notable changes are documented here. Versions follow [Semantic Versioning](h
 
 ### Rebuilt
 - The v2.0 and v2.1 features (Ledoit-Wolf, Black-Litterman, inverse volatility, risk parity, maximum
-  diversification, SMA indicators, cash in backtests, SMA trend-filter strategies) existed only in a
-  development workspace and were never published. They are re-implemented here from the design
-  specification in `docs/ARCHITECTURE.md`, with new tests (including the scikit-learn reference values).
+  diversification, SMA indicators, cash in backtests, SMA trend-filter strategies) were pushed in October
+  but later dropped from `main`. They are re-implemented here from the design specification in
+  `docs/ARCHITECTURE.md`, with new tests (including the scikit-learn reference values).
 
 ### Changed
 - Backtest strategies take a covariance method; `STRATEGY_FACTORIES` registry with 8 strategies.
